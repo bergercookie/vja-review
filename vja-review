@@ -323,17 +323,14 @@ def main() -> int:
 
         while True:
             c = read_single_char()
-            if c == "q":
+            # if q / ctrl-c is pressed, exit
+            if c == "q" or c == "\x03":
                 logger.info("Exiting ...")
+                return 0
 
             if c > "0" and c <= str(len(TaskOption)):
                 TaskOption(int(c)).run(task)
                 break
-
-            # if ctrl-c is pressed, exit
-            if c == "\x03":
-                logger.info("Exiting ...")
-                return 0
 
         sep()
 
