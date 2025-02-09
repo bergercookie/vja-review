@@ -1,0 +1,346 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.8"
+# dependencies = [
+#   "vja",
+#   "typing-extensions"
+# ]
+# ///
+
+import os
+import vja
+import random
+import argparse
+import datetime
+import json
+import logging
+import subprocess
+import sys
+import termios
+import tty
+from enum import Enum, auto
+from functools import cached_property
+from typing import Any, Callable, Protocol, Sequence, TypedDict
+from typing_extensions import assert_never
+
+logging.basicConfig(
+    # run basicConfig, set the format of the time to HH:MM:SS
+    format="%(asctime)s %(levelname)s - %(message)s",
+    datefmt="%H:%M:%S",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger("Vikunja Review")
+
+
+def read_single_char():
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(sys.stdin.fileno())
+        char = sys.stdin.read(1)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+    return char
+
+
+class JSONTask(TypedDict):
+    id: int
+    title: str
+    description: str
+    done: bool
+    done_at: str
+    due_date: str
+    reminders: str
+    project_id: int
+    repeat_after: str
+    repeat_mode: str
+    priority: int
+    start_date: str
+    end_date: str
+    assignees: str | None
+    labels: str | None
+    hex_color: str
+    percent_done: int
+    identifier: str
+    index: int
+    related_tasks: str
+    attachments: Any | None
+    cover_image_attachment_id: int
+    is_favorite: bool
+    created: str
+    updated: str
+    bucket_id: int
+    position: int
+    reactions: str | None
+    created_by: dict
+
+
+class TaskOption(Enum):
+    SKIP = auto()
+    COMPLETE = auto()
+    MOVE_TO_TODAY = auto()
+    MOVE_TO_NEXT_7_DAYS = auto()
+    MOVE_TO_COMING_MONDAY_MORNING = auto()
+    MOVE_TO_NEXT_30_DAYS = auto()
+    MOVE_SOMETIME_THIS_YEAR = auto()
+
+    def __str__(self) -> str:
+        return self.name.replace("_", " ").title()
+
+    def run(self, task: JSONTask) -> None:
+        _task_options_to_fns[self](task)
+
+    @cached_property
+    def is_implemented(self) -> bool:
+        return self in _task_options_to_fns
+
+
+TaskOptionFn = Callable[[JSONTask], None]
+
+
+class TaskFn:
+    @staticmethod
+    def skip(task: JSONTask) -> None:
+        del task
+        logger.info("Skipping ...")
+
+    @staticmethod
+    def complete(task: JSONTask) -> None:
+        args = ["vja", "task", "edit", str(task["id"]), "--done", "1"]
+
+        run_command(args)
+
+    @staticmethod
+    def _edit_due(task: JSONTask, td: datetime.timedelta | datetime.datetime):
+        if isinstance(td, datetime.datetime):
+            new_due = td
+        elif isinstance(td, datetime.timedelta):
+            new_due = datetime.datetime.now() + td
+        else:
+            assert_never(f"Expected datetime or timedelta, got {type(td)}")
+
+        td_str = new_due.strftime("%Y-%m-%dT%H:%M:%S")
+        args = ["vja", "task", "edit", task["id"], "--due", td_str]
+
+        run_command(args)
+
+    @staticmethod
+    def move_to_today(task: JSONTask) -> None:
+        hours = random.randint(0, 10)
+        TaskFn._edit_due(task, datetime.timedelta(hours=hours))
+
+    @staticmethod
+    def move_to_next_7_days(task: JSONTask) -> None:
+        num_days = random.randint(1, 7)
+        TaskFn._edit_due(task, datetime.timedelta(days=num_days))
+
+    @staticmethod
+    def move_to_next_30_days(task: JSONTask) -> None:
+        num_days = random.randint(1, 30)
+        TaskFn._edit_due(task, datetime.timedelta(days=num_days))
+
+    @staticmethod
+    def move_sometime_this_year(task: JSONTask) -> None:
+        num_days = random.randint(1, 365)
+        TaskFn._edit_due(task, datetime.timedelta(days=num_days))
+
+    @staticmethod
+    def move_to_coming_monday_morning(task: JSONTask) -> None:
+        today = datetime.datetime.now().replace(hour=9, minute=0, second=0)
+        days_until_monday = 7 - today.weekday()
+        new_dt = today + datetime.timedelta(days=days_until_monday)
+        TaskFn._edit_due(task, new_dt)
+
+
+_task_options_to_fns: dict[TaskOption, TaskOptionFn] = {
+    TaskOption.SKIP: TaskFn.skip,
+    TaskOption.COMPLETE: TaskFn.complete,
+    TaskOption.MOVE_TO_TODAY: TaskFn.move_to_today,
+    TaskOption.MOVE_TO_NEXT_7_DAYS: TaskFn.move_to_next_7_days,
+    TaskOption.MOVE_TO_NEXT_30_DAYS: TaskFn.move_to_next_30_days,
+    TaskOption.MOVE_SOMETIME_THIS_YEAR: TaskFn.move_sometime_this_year,
+    TaskOption.MOVE_TO_COMING_MONDAY_MORNING: TaskFn.move_to_coming_monday_morning,
+}
+
+
+def announce(title: str, description: str):
+    print(f"{title}")
+    print("-" * len(title))
+    print(f"{description}\n")
+
+
+def announce_list(title: str, items: list[str]):
+    numbered_li = [f"{i + 1}. {item}" for i, item in enumerate(items)]
+    announce(title, "\n".join(numbered_li))
+
+
+def sep():
+    print("\n")
+    print("-" * (os.get_terminal_size().columns - 5))
+    print("\n")
+
+
+def present_task(task: JSONTask, index: str | None = None) -> None:
+    lines = [
+        f"Title: {task['title']}",
+        f"Due Date: {task['due_date']}",
+        f"Project ID: {task['project_id']}",
+        f"Priority: {task['priority']}",
+        f"Created: {task['created']}",
+        f"Updated: {task['updated']}",
+    ]
+
+    if (desc := task["description"]) != "<p></p>":
+        lines.insert(1, desc)
+
+    title = f"Task {task['id']}"
+    if index is not None:
+        title = f"{index}. {title}"
+    announce(f"{title}", "\n".join(lines))
+    announce_list(
+        "Options", [str(option) for option in TaskOption if option.is_implemented]
+    )
+
+
+class SupportsStr(Protocol):
+    def __str__(self) -> str: ...
+
+
+def run_command(
+    cmd_args: Sequence[SupportsStr], check=True
+) -> subprocess.CompletedProcess:
+    str_cmd_args = [str(arg) for arg in cmd_args]
+    proc = subprocess.run(str_cmd_args, text=True, capture_output=True)
+    logger.info(f"Running command: {cmd_args}")
+    if proc.returncode != 0:
+        s = (
+            "Error running command\n\n"
+            f"Arguments: {cmd_args}\n\n"
+            f"Output: {proc.stdout}\n\n"
+            f"Error: {proc.stderr}"
+        )
+        if check:
+            raise RuntimeError(s)
+        else:
+            logger.error(s)
+
+    return proc
+
+
+def main() -> int:
+    # sanity check, make sure the vja command is available
+    try:
+        subprocess.run(["vja", "--version"], check=True, text=True, capture_output=True)
+    except FileNotFoundError:
+        logger.error(
+            "vja command not found, please either install it via pip first or "
+            "run this script as an executable (or via `uv run`) to have it "
+            "installed automatically ..."
+        )
+        return 1
+
+    # add an argument parser. this tool is about reviewing vikunja tasks in sequence and
+    # acting on each one.
+    parser = argparse.ArgumentParser(description="Review Vikunja tasks")
+    parser.add_argument(
+        "--overdue", action="store_true", help="Show only overdue tasks"
+    )
+    parser.add_argument(
+        "--today", action="store_true", help="Show only tasks due today"
+    )
+    parser.add_argument(
+        "--this-week", action="store_true", help="Show only tasks due this week"
+    )
+    parser.add_argument(
+        "--wo-date",
+        action="store_true",
+        help="Show only tasks that don't have a due date",
+    )
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="Login to Vikunja before running the script",
+    )
+
+    parser.epilog = """
+        Review your Vikunja tasks with ease.\n
+
+        When a task is shown, you can press a number to select an option (move task to today,
+        to next week, to next 7 days etc.), or 'q' to quit.
+        """
+    args = parser.parse_args()
+
+    # sanity check
+    if sum([args.overdue, args.today, args.this_week, args.wo_date]) > 1:
+        print("Only one of --overdue, --today, --this-week, --wo-date can be set")
+        return 1
+
+    cmd_args = [
+        "vja",
+        "tasks",
+        "ls",
+        "--json",
+    ]
+    if args.overdue:
+        # format the current datetime as YYYYMMDDTHHMMSS
+        now = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+        cmd_args.extend(["--due-date", f"lt {now}"])
+    elif args.today:
+        start_of_day = datetime.datetime.now().replace(hour=0, minute=0, second=0)
+        end_of_day = start_of_day.replace(hour=23, minute=59, second=59)
+        cmd_args.extend(
+            ["--due-date", f"ge {start_of_day}", "--due-date", f"le {end_of_day},"]
+        )
+    elif args.this_week:
+        # determine the start and end of the week
+        today = datetime.datetime.now()
+        start_of_week = today - datetime.timedelta(days=today.weekday())
+        end_of_week = start_of_week + datetime.timedelta(days=6)
+        cmd_args.extend(
+            ["--due-date", f"ge {start_of_week}", "--due-date", f"le {end_of_week},"]
+        )
+    elif args.wo_date:
+        cmd_args.extend(["--due-date", ""])
+    else:
+        logger.error("No flag set - please see --help and run again. Exiting ...")
+        return 1
+
+    proc = run_command(cmd_args, check=False)
+    if proc.returncode != 0 and "Could not load" in str(proc.stderr):
+        # if the error contains "Could not load" run the `vja login` command
+        logger.error(
+            "\n\nYou're not currently logged in to vikunja. "
+            "Please follow the instructions on this page to login with vja (run it either via `uv run vja` or by directly running vja - depending on how you executed `vja-review`: https://pypi.org/project/vja/"
+        )
+        return 1
+
+    tasks: list[JSONTask] = json.loads(proc.stdout)
+    logger.info(f"Found {len(tasks)} tasks")
+
+    for task_i, task in enumerate(tasks, start=1):
+        present_task(task, index=f"{task_i}/{len(tasks)}")
+
+        while True:
+            c = read_single_char()
+            if c == "q":
+                logger.info("Exiting ...")
+
+            if c > "0" and c <= str(len(TaskOption)):
+                TaskOption(int(c)).run(task)
+                break
+
+            # if ctrl-c is pressed, exit
+            if c == "\x03":
+                logger.info("Exiting ...")
+                return 0
+
+        sep()
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+# vim: ft=python
