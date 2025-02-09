@@ -1,6 +1,6 @@
 # `vja-review`
 
-`vja-review` is a python wrapper around `[vja`](https://gitlab.com/ce72/vja), a
+`vja-review` is a python wrapper around [`vja`](https://gitlab.com/ce72/vja), a
 command line tool for interacting with [`Vikunja`](https://vikunja.io/). Its
 goal it to offer an easy way of reviewing tasks that are either overdue, or are
 in a given range (e.g., today's or this week's tasks).
@@ -49,7 +49,7 @@ Options
 7. Move Sometime This Year
 ```
 
-> ![NOTE]
+> [!NOTE]
 > The script will prompt you to choose an action and once it received the
 > numeric input it will proceed immediately with showing you the next task,
 > without waiting for you to press enter.
