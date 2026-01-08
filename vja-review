@@ -7,28 +7,38 @@
 # ]
 # ///
 
-import os
-import random
 import argparse
+import asyncio
 import datetime
 import json
 import logging
+import os
+import random
 import subprocess
 import sys
 import termios
 import tty
+from collections.abc import Sequence
 from enum import Enum, auto
-from typing import Any, Callable, Protocol, Sequence, TypedDict
+from typing import Any, Callable, Coroutine, Protocol, Sequence, TypedDict
+
 from typing_extensions import assert_never
 
 logging.basicConfig(
-    # run basicConfig, set the format of the time to HH:MM:SS
     format="%(asctime)s %(levelname)s - %(message)s",
     datefmt="%H:%M:%S",
     level=logging.INFO,
 )
 
 logger = logging.getLogger("Vikunja Review")
+
+pending_async_tasks: set[asyncio.Task[Any]] = set()
+
+
+def add_async_cmd(
+    cmd: Coroutine[Any, Any, subprocess.CompletedProcess],
+) -> None:
+    pending_async_tasks.add(asyncio.create_task(cmd))
 
 
 def read_single_char():
@@ -87,11 +97,8 @@ class TaskOption(Enum):
     def __str__(self) -> str:
         return self.name.replace("_", " ").title()
 
-    def run(self, task: JSONTask) -> None:
+    def dispatch(self, task: JSONTask) -> None:
         _task_options_to_fns[self](task)
-
-
-TaskOptionFn = Callable[[JSONTask], None]
 
 
 class TaskFn:
@@ -104,7 +111,7 @@ class TaskFn:
     def complete(task: JSONTask) -> None:
         args = ["vja", "task", "edit", str(task["id"]), "--done", "1"]
 
-        run_command(args)
+        add_async_cmd(run_command_async(args))
 
     @staticmethod
     def _edit_due(task: JSONTask, td: datetime.timedelta | datetime.datetime):
@@ -118,7 +125,7 @@ class TaskFn:
         td_str = new_due.strftime("%Y-%m-%dT%H:%M:%S")
         args = ["vja", "task", "edit", task["id"], "--due", td_str]
 
-        run_command(args)
+        add_async_cmd(run_command_async(args))
 
     @staticmethod
     def move_to_today(task: JSONTask) -> None:
@@ -160,6 +167,7 @@ class TaskFn:
         TaskFn._edit_due(task, new_dt)
 
 
+TaskOptionFn = Callable[[JSONTask], None]
 _task_options_to_fns: dict[TaskOption, TaskOptionFn] = {
     TaskOption.SKIP: TaskFn.skip,
     TaskOption.COMPLETE: TaskFn.complete,
@@ -243,7 +251,48 @@ def run_command(
     return proc
 
 
-def main() -> int:
+async def run_command_async(
+    cmd_args: Sequence[SupportsStr], *, check: bool = True
+) -> subprocess.CompletedProcess[str]:
+    str_cmd_args = [str(arg) for arg in cmd_args]
+
+    logger.info("Running command, asynchronously: %s", cmd_args)
+
+    proc = await asyncio.create_subprocess_exec(
+        *str_cmd_args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    stdout_b, stderr_b = await proc.communicate()
+
+    stdout = stdout_b.decode()
+    stderr = stderr_b.decode()
+
+    # we've waited for the process to complete, so returncode must be set
+    assert proc.returncode is not None
+
+    if proc.returncode != 0:
+        s = (
+            "Error running command\n\n"
+            f"Arguments: {cmd_args}\n\n"
+            f"Output: {stdout}\n\n"
+            f"Error: {stderr}"
+        )
+        if check:
+            raise RuntimeError(s)
+        else:
+            logger.error(s)
+
+    return subprocess.CompletedProcess(
+        args=str_cmd_args,
+        returncode=proc.returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+
+async def amain() -> int:
     # sanity check, make sure the vja command is available
     try:
         subprocess.run(["vja", "--version"], check=True, text=True, capture_output=True)
@@ -304,23 +353,27 @@ def main() -> int:
     elif args.today:
         start_of_day = datetime.datetime.now().replace(hour=0, minute=0, second=0)
         end_of_day = start_of_day.replace(hour=23, minute=59, second=59)
-        cmd_args.extend([
-            "--due-date",
-            f"ge {start_of_day}",
-            "--due-date",
-            f"le {end_of_day},",
-        ])
+        cmd_args.extend(
+            [
+                "--due-date",
+                f"ge {start_of_day}",
+                "--due-date",
+                f"le {end_of_day},",
+            ]
+        )
     elif args.this_week:
         # determine the start and end of the week
         today = datetime.datetime.now()
         start_of_week = today - datetime.timedelta(days=today.weekday())
         end_of_week = start_of_week + datetime.timedelta(days=6)
-        cmd_args.extend([
-            "--due-date",
-            f"ge {start_of_week}",
-            "--due-date",
-            f"le {end_of_week},",
-        ])
+        cmd_args.extend(
+            [
+                "--due-date",
+                f"ge {start_of_week}",
+                "--due-date",
+                f"le {end_of_week},",
+            ]
+        )
     elif args.wo_date:
         cmd_args.extend(["--due-date", ""])
     else:
@@ -354,12 +407,20 @@ def main() -> int:
                 c = "1"
 
             if c > "0" and c <= str(len(TaskOption)):
-                TaskOption(int(c)).run(task)
+                TaskOption(int(c)).dispatch(task)
                 break
 
         sep()
 
+    if pending_async_tasks:
+        logger.info("Waiting for pending async tasks to complete ...")
+        await asyncio.gather(*pending_async_tasks)
+
     return 0
+
+
+def main() -> int:
+    return asyncio.run(amain())
 
 
 if __name__ == "__main__":
